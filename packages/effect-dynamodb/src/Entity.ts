@@ -6674,9 +6674,12 @@ const makeImpl = <
       // Sparse-map .clearMap — Get-then-Update helper. Reads the current
       // item with a consistent read to discover which `<prefix>#*` attrs
       // exist, then folds the resulting REMOVEs into this same UpdateItem.
-      // The version CAS (when configured) provides atomicity; non-versioned
-      // entities are best-effort (a concurrent writer can add a new bucket
-      // between the read and the update — that bucket survives).
+      // On a versioned entity the update is conditioned on the version that
+      // read found (`casRead`), so a writer adding a bucket in between makes
+      // it fail rather than survive the clear; a stale `expectedVersion` is
+      // refused before anything is sent. Non-versioned entities are
+      // best-effort (a concurrent writer can add a new bucket between the read
+      // and the update — that bucket survives).
       if (uState.sparseClearFields && uState.sparseClearFields.length > 0) {
         for (const field of uState.sparseClearFields) {
           if (!hasSparseFields || !(field in sparseFields)) {
@@ -6694,6 +6697,23 @@ const makeImpl = <
           ConsistentRead: true,
         })
         if (clearGetResult.Item) {
+          if (systemFields.version && casRead === undefined && retainSnapshot === undefined) {
+            yield* checkVersion(clearGetResult.Item, "update")
+            const clearedRaw = fromAttributeMap(clearGetResult.Item) as globalThis.Record<
+              string,
+              unknown
+            >
+            const version = (clearedRaw[systemFields.version] as number | undefined) ?? 0
+            if (evExpected !== undefined && version !== evExpected) {
+              return yield* new OptimisticLockError({
+                entityType,
+                key: encodedKey,
+                expectedVersion: evExpected,
+                actualVersion: version,
+              })
+            }
+            casRead = { raw: clearGetResult.Item, version }
+          }
           const clearItemKeys = Object.keys(clearGetResult.Item)
           for (const field of uState.sparseClearFields) {
             const sparse = sparseFields[field]!

@@ -38,3 +38,10 @@ A transaction refuses, with a `ValidationError`, an update `.cascade(...)`
 a delete (**EDD-9060**), and an update of an entity with `vectorIndexes`
 (**EDD-9061**). The new `TransactWriteUpdateOp` type is `transactWrite`-only:
 `EventStore.append({ additionalItems })` and `Batch.write` are unchanged.
+
+The standalone `update` gets one fix, which transactions inherit through it: a
+**`clearMap` on a versioned entity now conditions the write on the version its
+read found**. Before, a bucket added between the read and the write survived the
+clear, even though a comment and `DESIGN.md` described a version CAS. A
+concurrent write is now an `OptimisticLockError`, and a stale `expectedVersion`
+is refused against that read before anything is sent.
