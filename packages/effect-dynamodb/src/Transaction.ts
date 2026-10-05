@@ -11,11 +11,15 @@
 
 import {
   type ConcurrentModification,
+  type ConditionalCheckFailed,
   DynamoError,
+  type ItemNotFound,
   isAwsTransactionCancelled,
   type OptimisticLockError,
+  type RefNotFound,
   TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,
+  type TransactionOverflow,
   type UniqueConstraintViolation,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
@@ -36,8 +40,10 @@ import {
   ConditionCheckTypeId,
   GUARDED_TRANSACTION_ATTEMPTS,
   judgeCancellation,
+  planTransactWriteOps,
   refuseOversizedTransaction,
   type TransactWriteOp,
+  type TransactWriteUpdateOp,
 } from "./internal/TransactWriteOps.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
 import type { TableConfig } from "./Table.js"
@@ -49,7 +55,12 @@ import type { TableConfig } from "./Table.js"
 // `additionalItems`) and re-exported here so the public surface is unchanged.
 // ---------------------------------------------------------------------------
 
-export { ConditionCheckTypeId, type ConditionCheckOp, type TransactWriteOp }
+export {
+  ConditionCheckTypeId,
+  type ConditionCheckOp,
+  type TransactWriteOp,
+  type TransactWriteUpdateOp,
+}
 
 /**
  * Create a conditionCheck operation from a get descriptor and a condition.
@@ -214,16 +225,30 @@ export const transactGet = <const T extends ReadonlyArray<AnyGet>>(
  * `ConcurrentModification`. A caller's own condition failing is
  * `TransactionCancelled`; a taken unique value is `UniqueConstraintViolation`.
  *
+ * **Updates and multi-item deletes.** An `update` (or `patch`), and a delete of
+ * an entity with `unique`, `versioned: { retain: true }` or `softDelete`, write
+ * exactly what the same op writes on its own: the op is run with its write
+ * recorded instead of sent, and the recorded items join the transaction —
+ * guarded, sentinel rotations and releases, snapshot and tombstone included.
+ * Each reads first wherever the standalone op does, so the read's outcomes
+ * surface before anything is sent: `ItemNotFound`, `ConditionalCheckFailed`
+ * (`patch` of a missing item), `OptimisticLockError` (a stale
+ * `expectedVersion`), `RefNotFound`. A race with that read is retried as for a
+ * guarded put. Refused: an update `.cascade()` (EDD-9059), `.returnValues()`
+ * that returns an item (EDD-9060), and an update of a vector-indexed entity
+ * (EDD-9061).
+ *
  * ```typescript
  * yield* Transaction.transactWrite([
  *   Users.put({ userId: "u-1", ... }),
+ *   Users.update({ userId: "u-2" }).pipe(Entity.set({ email: "b@example.com" })),
  *   Posts.delete({ postId: "p-3" }),
  *   Users.get({ userId: "u-1" }).pipe(Transaction.check(expr)),
  * ])
  * ```
  */
 export const transactWrite = (
-  operations: ReadonlyArray<TransactWriteOp>,
+  operations: ReadonlyArray<TransactWriteOp | TransactWriteUpdateOp>,
 ): Effect.Effect<
   void,
   | DynamoClientError
@@ -231,7 +256,11 @@ export const transactWrite = (
   | TransactionCancelled
   | UniqueConstraintViolation
   | OptimisticLockError
-  | ConcurrentModification,
+  | ConcurrentModification
+  | ConditionalCheckFailed
+  | ItemNotFound
+  | TransactionOverflow
+  | RefNotFound,
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
@@ -240,8 +269,13 @@ export const transactWrite = (
     const client = yield* DynamoClient
     let lost: OptimisticLockError | ConcurrentModification | undefined
     for (let attempt = 0; attempt < GUARDED_TRANSACTION_ATTEMPTS; attempt++) {
-      const built = yield* buildTransactWriteItems(operations, "transactWrite")
+      // Planned every attempt: a lost race is planned again from fresh reads.
+      const plans = yield* planTransactWriteOps(operations)
+      const built = yield* buildTransactWriteItems(operations, "transactWrite", plans)
       const transactItems = built.items
+      // Every op resolved to no write — as a standalone no-op update does.
+      // DynamoDB rejects an empty TransactItems list.
+      if (transactItems.length === 0) return
 
       // Counted AFTER expansion: one op can emit several items (a guarded put
       // emits the item, its sentinel reservations and releases, and its

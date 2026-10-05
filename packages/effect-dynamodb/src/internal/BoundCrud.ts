@@ -106,6 +106,15 @@ export interface BoundWriteOp {
   readonly _boundOpType: "put" | "delete"
 }
 
+/**
+ * A bound `update` builder, accepted by `Transaction.transactWrite` only — see
+ * `TransactWriteUpdateOp`. Erased for the same reason as {@link BoundWriteOp}.
+ */
+export interface BoundUpdateOp {
+  readonly [BoundOpTypeId]: BoundOpTypeId
+  readonly _boundOpType: "update"
+}
+
 /** Condition input accepted by `.condition()` — callback or shorthand record. */
 export type ConditionArg<Model> =
   | ((t: PathBuilder<Model, Model, never>, ops: ConditionOps<Model>) => Expr)

@@ -570,9 +570,9 @@ yield* matchEvents.append(
 Conditions ride along: `.condition({ ... })` on a bound put or delete, and the implicit `attribute_not_exists` guard `create()` carries, are compiled into the transact item. A failing one surfaces as `AdditionalItemConditionFailed`, not a version conflict.
 
 :::caution[`upsert` is not a transact item]
-`upsert` is deliberately **not** accepted here, and neither is `update` / `patch`. An `upsert` is an `UpdateItem` whose `SET` clause uses `if_not_exists` for `createdAt`, immutable fields and the version counter — compiling it into a `TransactWriteItems` `Put` would reset all three. Rather than do that quietly, `append` fails with a `ValidationError` naming `upsert`. Use `put()` or `create()` in the transaction, or run the upsert as its own operation outside it.
+`upsert` is deliberately **not** accepted here, and neither is `update` / `patch` (`Transaction.transactWrite` accepts those: it plans them from the entity's own op, which reads first — `append` does not). An `upsert` is an `UpdateItem` whose `SET` clause uses `if_not_exists` for `createdAt`, immutable fields and the version counter — compiling it into a `TransactWriteItems` `Put` would reset all three. Rather than do that quietly, `append` fails with a `ValidationError` naming `upsert`. Use `put()` or `create()` in the transaction, or run the upsert as its own operation outside it.
 
-A **delete** of an entity configured with `unique`, `versioned: { retain: true }` or `softDelete` is refused for a related reason (**EDD-9048**): the extra items such a delete must write are derived from the *stored* row, and this path builds a delete from its key alone. Use the entity's own `delete`.
+A **delete** of an entity configured with `unique`, `versioned: { retain: true }` or `softDelete` is refused for a related reason (**EDD-9048**): the extra items such a delete must write are derived from the *stored* row, and this path builds a delete from its key alone. Use `Transaction.transactWrite` or the entity's own `delete`.
 :::
 
 ### One additional item can become several

@@ -167,6 +167,20 @@ const SoftNotes = Entity.make({
   softDelete: true,
 })
 
+class VectorDoc extends Schema.Class<VectorDoc>("VectorDoc")({
+  docId: Schema.String,
+  body: Schema.String,
+}) {}
+
+const VectorDocs = Entity.make({
+  model: VectorDoc,
+  entityType: "VectorDoc",
+  primaryKey: { pk: { field: "pk", composite: ["docId"] }, sk: { field: "sk", composite: [] } },
+  vectorIndexes: {
+    byBody: { name: "vec1", dimensions: 4, distance: "cosine", source: { fields: ["body"] } },
+  },
+})
+
 const MainTable = Table.make({
   schema: AppSchema,
   entities: {
@@ -179,6 +193,7 @@ const MainTable = Table.make({
     SparseMembers,
     RenamedMembers,
     SoftNotes,
+    VectorDocs,
   },
 })
 
@@ -1008,27 +1023,125 @@ describe("Transaction", () => {
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("a delete of a lifecycle entity is rejected with EDD-9048", () =>
+    const memberRow = (version: number) =>
+      toAttributeMap({
+        pk: "$myapp#v1#lifecyclemember#memberid_m-1",
+        sk: "$myapp#v1#lifecyclemember",
+        __edd_e__: "LifecycleMember",
+        memberId: "m-1",
+        email: "a@x.io",
+        label: "L",
+        version,
+      })
+
+    it.effect(
+      "a delete of a lifecycle entity is planned from a read and joins the transaction",
+      () =>
+        Effect.gen(function* () {
+          mockGetItem.mockImplementation(async (input: any) =>
+            fromAttributeMap(input.Key).sk === "$myapp#v1#lifecyclemember"
+              ? { Item: memberRow(1) }
+              : {},
+          )
+          mockTransactWriteItems.mockResolvedValueOnce({})
+
+          yield* Transaction.transactWrite([
+            LifecycleMembers.delete({ memberId: "m-1" }),
+            OrderEntity.put({
+              orderId: "o-1",
+              userId: "u-1",
+              product: "Widget",
+              quantity: 1,
+              status: "pending",
+            }),
+          ])
+
+          // The entity's own delete read the row — consistently, as standalone.
+          expect(mockGetItem).toHaveBeenCalled()
+          expect(mockTransactWriteItems).toHaveBeenCalledTimes(1)
+          const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+          const main = items.find(
+            (i: any) =>
+              i.Delete && fromAttributeMap(i.Delete.Key).sk === "$myapp#v1#lifecyclemember",
+          )
+          // Guarded on what was read, exactly as the standalone delete is.
+          expect(main?.Delete.ConditionExpression).toBeDefined()
+          // The retain snapshot of the outgoing row joins it.
+          expect(
+            items.some(
+              (i: any) => i.Put && String(fromAttributeMap(i.Put.Item).sk).includes("#v#"),
+            ),
+          ).toBe(true)
+          // …and so does the other op.
+          expect(
+            items.some((i: any) => i.Put && fromAttributeMap(i.Put.Item).__edd_e__ === "Order"),
+          ).toBe(true)
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a delete of a softDelete entity writes the tombstone it reads for", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockImplementation(async () => ({
+          Item: toAttributeMap({
+            pk: "$myapp#v1#softnote#noteid_n-1",
+            sk: "$myapp#v1#softnote",
+            __edd_e__: "SoftNote",
+            noteId: "n-1",
+            body: "b",
+          }),
+        }))
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([SoftNotes.delete({ noteId: "n-1" })])
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        expect(items.some((i: any) => i.Delete !== undefined)).toBe(true)
+        const tombstone = items.find((i: any) => i.Put)?.Put
+        expect(String(fromAttributeMap(tombstone.Item).sk)).toContain("#deleted#")
+        expect(fromAttributeMap(tombstone.Item).body).toBe("b")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "a multi-item delete of a missing row fails with ItemNotFound and writes nothing",
+      () =>
+        Effect.gen(function* () {
+          const error = yield* Transaction.transactWrite([
+            LifecycleMembers.delete({ memberId: "m-gone" }),
+            UserEntity.put({ userId: "u-1", email: "a@x.io", name: "A", role: "admin" }),
+          ]).pipe(Effect.flip)
+
+          expect(error._tag).toBe("ItemNotFound")
+          expect(mockTransactWriteItems).not.toHaveBeenCalled()
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects a delete returning an item, on a plain entity — EDD-9060", () =>
       Effect.gen(function* () {
         const error = yield* Transaction.transactWrite([
-          LifecycleMembers.delete({ memberId: "m-1" }),
+          // @ts-expect-error — a delete that returns an item is not a transact op;
+          // the runtime refusal below is the backstop for untyped callers.
+          UserEntity.delete({ userId: "u-1" }).pipe(Entity.returnValues("allOld")),
         ]).pipe(Effect.flip)
 
         expect(error._tag).toBe("ValidationError")
-        expect(String((error as ValidationError).cause)).toContain("EDD-9048")
+        expect(String((error as ValidationError).cause)).toContain("[EDD-9060]")
         expect(mockTransactWriteItems).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("a delete of a softDelete entity is rejected — a tombstone needs a read", () =>
+    it.effect("rejects a delete returning an item, on a unique entity — before reading", () =>
       Effect.gen(function* () {
-        const error = yield* Transaction.transactWrite([SoftNotes.delete({ noteId: "n-1" })]).pipe(
-          Effect.flip,
-        )
+        const error = yield* Transaction.transactWrite([
+          // @ts-expect-error — a delete that returns an item is not a transact op;
+          // the runtime refusal below is the backstop for untyped callers.
+          LifecycleMembers.delete({ memberId: "m-1" }).pipe(Entity.returnValues("allOld")),
+        ]).pipe(Effect.flip)
 
         expect(error._tag).toBe("ValidationError")
-        expect(String((error as ValidationError).cause)).toContain("EDD-9048")
-        expect(String((error as ValidationError).cause)).toContain("softDelete")
+        expect(String((error as ValidationError).cause)).toContain("[EDD-9060]")
+        expect(mockGetItem).not.toHaveBeenCalled()
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -1325,6 +1438,156 @@ describe("Transaction", () => {
       expect(itemBytes({ b: { B: new Uint8Array(10) } })).toBe(11)
       expect(transactItemBytes({ Delete: { TableName: "t", Key: { pk: { S: "abc" } } } })).toBe(5)
     })
+  })
+
+  describe("update ops", () => {
+    const sparseRow = (email: string) =>
+      toAttributeMap({
+        pk: "$myapp#v1#sparsemember#memberid_m-1",
+        sk: "$myapp#v1#sparsemember",
+        __edd_e__: "SparseMember",
+        memberId: "m-1",
+        email,
+        label: "L",
+      })
+
+    it.effect("an update of a plain entity is one Update item, with no read", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([
+          UserEntity.update({ userId: "u-1" }).pipe(Entity.set({ name: "Renamed" })),
+          OrderEntity.put({
+            orderId: "o-1",
+            userId: "u-1",
+            product: "Widget",
+            quantity: 1,
+            status: "pending",
+          }),
+        ])
+
+        expect(mockGetItem).not.toHaveBeenCalled()
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        expect(items).toHaveLength(2)
+        expect(fromAttributeMap(items[0].Update.Key).pk).toBe("$myapp#v1#user#userid_u-1")
+        expect(Object.values(items[0].Update.ExpressionAttributeNames)).toContain("name")
+        // A transact item takes no ReturnValues — only the single-item request did.
+        expect(items[0].Update).not.toHaveProperty("ReturnValues")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a bound update from db.entities.* is accepted", () =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: { UserEntity }, tables: { MainTable } })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([
+          db.entities.UserEntity.update({ userId: "u-1" }).set({ name: "Bound" }),
+        ])
+
+        expect(mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Update).toBeDefined()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("patch() keeps its attribute_exists guard on the Update item", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([
+          UserEntity.patch({ userId: "u-1" }).pipe(Entity.set({ name: "Patched" })),
+        ])
+
+        const update = mockTransactWriteItems.mock.calls[0]![0].TransactItems[0].Update
+        expect(update.ConditionExpression).toContain("attribute_exists")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a taken unique value is reported as UniqueConstraintViolation with its fields", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockImplementation(async (input: any) =>
+          fromAttributeMap(input.Key).sk === "$myapp#v1#sparsemember"
+            ? { Item: sparseRow("old@x.io") }
+            : {},
+        )
+        // Cancel the transaction AT the new email's reservation, wherever the
+        // entity's own update placed it.
+        mockTransactWriteItems.mockImplementationOnce(async (input: any) => {
+          const error = new Error("cancelled")
+          ;(error as any).name = "TransactionCanceledException"
+          ;(error as any).CancellationReasons = input.TransactItems.map((i: any) =>
+            i.Put && fromAttributeMap(i.Put.Item).__edd_e__ === "SparseMember._unique.email"
+              ? { Code: "ConditionalCheckFailed" }
+              : { Code: "None" },
+          )
+          throw error
+        })
+
+        const error = yield* Transaction.transactWrite([
+          SparseMembers.update({ memberId: "m-1" }).pipe(Entity.set({ email: "taken@x.io" })),
+          UserEntity.put({ userId: "u-1", email: "a@x.io", name: "A", role: "admin" }),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("UniqueConstraintViolation")
+        const violation = error as UniqueConstraintViolation
+        expect(violation.entityType).toBe("SparseMember")
+        expect(violation.constraint).toBe("email")
+        expect(violation.fields).toEqual({ email: "taken@x.io" })
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a transaction of only no-op updates sends nothing", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockImplementation(async () => ({ Item: sparseRow("a@x.io") }))
+
+        yield* Transaction.transactWrite([
+          SparseMembers.update({ memberId: "m-1" }).pipe(Entity.set({})),
+        ])
+
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects cascade — EDD-9059", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([
+          RefProjects.update({ projectId: "p-1" }).pipe(
+            Entity.set({ projectName: "Renamed" }),
+            Entity.cascade({ targets: [RefTasks] }),
+          ),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("[EDD-9059] cascade")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects an update returning an item — EDD-9060", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([
+          UserEntity.update({ userId: "u-1" }).pipe(
+            Entity.set({ name: "Renamed" }),
+            Entity.returnValues("allOld"),
+          ),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("[EDD-9060] returnValues")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("rejects an update of a vector-indexed entity — EDD-9061", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([
+          VectorDocs.update({ docId: "d-1" }).pipe(Entity.set({ body: "new" })),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("[EDD-9061]")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
   })
 
   describe("unsupported ops are rejected, not silently reinterpreted (#100)", () => {

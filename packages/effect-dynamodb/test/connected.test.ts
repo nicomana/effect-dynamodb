@@ -2024,18 +2024,285 @@ describeConnected("Connected integration tests", () => {
       }).pipe(provide),
     )
 
-    it.effect("transactWrite refuses a delete whose side items need a read (#113)", () =>
+    const sentinelOwner = (email: string) =>
       Effect.gen(function* () {
-        const err = yield* Transaction.transactWrite([Users.delete({ userId: "u-tx" })]).pipe(
-          Effect.flip,
+        const client = yield* DynamoClient
+        const sentinel = yield* client.getItem({
+          TableName: tableName,
+          Key: {
+            pk: { S: `$connected-test#v1#user.email#${email}` },
+            sk: { S: "$connected-test#v1#user.email" },
+          },
+        })
+        return sentinel.Item?._entity_pk?.S
+      })
+
+    const taskExists = (taskId: string) =>
+      Tasks.get({ taskId })
+        .asEffect()
+        .pipe(
+          Effect.map(() => true),
+          Effect.catchTag("ItemNotFound", () => Effect.succeed(false)),
         )
 
-        expect(err._tag).toBe("ValidationError")
-        expect(String((err as ValidationError).cause)).toContain("EDD-9048")
+    const txTask = (taskId: string) =>
+      Tasks.put({ taskId, userId: "u-tx", title: "Audit row", status: "todo", priority: 1 })
 
-        // Refused up front: the row and its sentinel are both untouched.
-        const still = yield* Users.get({ userId: "u-tx" }).asEffect()
-        expect(still.displayName).toBe("TxUser")
+    it.effect("transactWrite updates a unique field and rotates its sentinel atomically", () =>
+      Effect.gen(function* () {
+        yield* Users.put({
+          userId: "u-txu",
+          email: "txu-old@test.com",
+          displayName: "Before",
+          role: "member",
+          createdBy: "test",
+        }).asEffect()
+
+        yield* Transaction.transactWrite([
+          Users.update({ userId: "u-txu" }).pipe(Entity.set({ email: "txu-new@test.com" })),
+          txTask("t-txu"),
+        ])
+
+        const user = yield* Users.get({ userId: "u-txu" }).asEffect()
+        expect(user.email).toBe("txu-new@test.com")
+        expect(yield* taskExists("t-txu")).toBe(true)
+        // The old value is released and the new one is reserved for this row.
+        expect(yield* sentinelOwner("txu-old@test.com")).toBeUndefined()
+        expect(yield* sentinelOwner("txu-new@test.com")).toBe(
+          "$connected-test#v1#user#userid_u-txu",
+        )
+        // Released means reusable.
+        yield* Users.put({
+          userId: "u-txu-reuse",
+          email: "txu-old@test.com",
+          displayName: "Reuse",
+          role: "member",
+          createdBy: "test",
+        }).asEffect()
+      }).pipe(provide),
+    )
+
+    it.effect("a retain entity's transactional update bumps the version and snapshots it", () =>
+      Effect.gen(function* () {
+        yield* Users.put({
+          userId: "u-txr",
+          email: "txr@test.com",
+          displayName: "v1",
+          role: "member",
+          createdBy: "test",
+        }).asEffect()
+        const before = yield* Users.get({ userId: "u-txr" }).pipe(Entity.asRecord)
+
+        // displayName is not unique: the retain path alone forces the read-merge Put.
+        yield* Transaction.transactWrite([
+          Users.update({ userId: "u-txr" }).pipe(Entity.set({ displayName: "v2" })),
+          txTask("t-txr"),
+        ])
+
+        const after = yield* Users.get({ userId: "u-txr" }).pipe(Entity.asRecord)
+        expect(after.displayName).toBe("v2")
+        expect(after.version).toBe(before.version + 1)
+        expect(yield* taskExists("t-txr")).toBe(true)
+
+        // The outgoing version was retained, exactly as a standalone update does.
+        const client = yield* DynamoClient
+        const snapshot = yield* client.getItem({
+          TableName: tableName,
+          Key: {
+            pk: { S: "$connected-test#v1#user#userid_u-txr" },
+            sk: {
+              S: `$connected-test#v1#user#v#${String(before.version).padStart(7, "0")}`,
+            },
+          },
+        })
+        expect(snapshot.Item?.displayName?.S).toBe("v1")
+      }).pipe(provide),
+    )
+
+    it.effect("a taken unique value on update rolls the whole transaction back", () =>
+      Effect.gen(function* () {
+        // tx@test.com is held by u-tx (first test in this block).
+        const err = yield* Transaction.transactWrite([
+          Users.update({ userId: "u-txu" }).pipe(Entity.set({ email: "tx@test.com" })),
+          txTask("t-txu-rollback"),
+        ]).pipe(Effect.flip)
+
+        expect(err._tag).toBe("UniqueConstraintViolation")
+        expect((err as UniqueConstraintViolation).fields).toEqual({ email: "tx@test.com" })
+
+        // Nothing landed: the other write, the row and both sentinels are untouched.
+        expect(yield* taskExists("t-txu-rollback")).toBe(false)
+        const user = yield* Users.get({ userId: "u-txu" }).asEffect()
+        expect(user.email).toBe("txu-new@test.com")
+        expect(yield* sentinelOwner("txu-new@test.com")).toBe(
+          "$connected-test#v1#user#userid_u-txu",
+        )
+        expect(yield* sentinelOwner("tx@test.com")).toBe("$connected-test#v1#user#userid_u-tx")
+      }).pipe(provide),
+    )
+
+    it.effect("a stale expectedVersion on update refuses the transaction before sending", () =>
+      Effect.gen(function* () {
+        const current = yield* Users.get({ userId: "u-txu" }).pipe(Entity.asRecord)
+        const err = yield* Transaction.transactWrite([
+          Users.update({ userId: "u-txu" }).pipe(
+            Entity.set({ displayName: "Stale" }),
+            Entity.expectedVersion(current.version - 1),
+          ),
+          txTask("t-txu-stale"),
+        ]).pipe(Effect.flip)
+
+        expect(err._tag).toBe("OptimisticLockError")
+        expect(yield* taskExists("t-txu-stale")).toBe(false)
+      }).pipe(provide),
+    )
+
+    it.effect("transactWrite deletes a unique entity and releases its sentinel", () =>
+      Effect.gen(function* () {
+        yield* Users.put({
+          userId: "u-txd",
+          email: "txd@test.com",
+          displayName: "ToDelete",
+          role: "member",
+          createdBy: "test",
+        }).asEffect()
+
+        yield* Transaction.transactWrite([Users.delete({ userId: "u-txd" }), txTask("t-txd")])
+
+        const gone = yield* Users.get({ userId: "u-txd" })
+          .asEffect()
+          .pipe(
+            Effect.map(() => "exists"),
+            Effect.catchTag("ItemNotFound", () => Effect.succeed("not found")),
+          )
+        expect(gone).toBe("not found")
+        expect(yield* taskExists("t-txd")).toBe(true)
+        // Before this path read the row, the sentinel was orphaned and the
+        // value unusable forever.
+        expect(yield* sentinelOwner("txd@test.com")).toBeUndefined()
+      }).pipe(provide),
+    )
+
+    /**
+     * Run `body` against a client that lets `concurrent` land between the
+     * FIRST read and everything after it — the window a plan's read opens.
+     */
+    const raceAfterFirstRead = <A, E>(
+      concurrent: Effect.Effect<unknown, unknown, DynamoClient | Table.TableConfig>,
+      body: Effect.Effect<A, E, DynamoClient | Table.TableConfig>,
+    ) =>
+      Effect.gen(function* () {
+        const real = yield* DynamoClient
+        let fired = false
+        return yield* body.pipe(
+          Effect.provideService(DynamoClient, {
+            ...real,
+            getItem: (input) =>
+              real.getItem(input).pipe(
+                Effect.tap(() => {
+                  if (fired) return Effect.void
+                  fired = true
+                  return concurrent.pipe(Effect.provideService(DynamoClient, real), Effect.orDie)
+                }),
+              ),
+          }),
+        )
+      })
+
+    it.effect(
+      "a row changed between a delete's read and its write is planned again and deleted",
+      () =>
+        Effect.gen(function* () {
+          yield* Users.put({
+            userId: "u-race",
+            email: "race-a@test.com",
+            displayName: "Race",
+            role: "member",
+            createdBy: "test",
+          }).asEffect()
+
+          // The plan reads email A; a concurrent update then moves it to B. The
+          // guarded delete is cancelled, and — the caller set no condition — the
+          // transaction is planned again from a fresh read and written.
+          yield* raceAfterFirstRead(
+            Users.update({ userId: "u-race" })
+              .pipe(Entity.set({ email: "race-b@test.com" }))
+              .asEffect(),
+            Transaction.transactWrite([Users.delete({ userId: "u-race" }), txTask("t-race")]),
+          )
+
+          const gone = yield* Users.get({ userId: "u-race" })
+            .asEffect()
+            .pipe(
+              Effect.map(() => "exists"),
+              Effect.catchTag("ItemNotFound", () => Effect.succeed("not found")),
+            )
+          expect(gone).toBe("not found")
+          // B's sentinel is released, not orphaned — the delete was planned from B.
+          expect(yield* sentinelOwner("race-a@test.com")).toBeUndefined()
+          expect(yield* sentinelOwner("race-b@test.com")).toBeUndefined()
+          expect(yield* taskExists("t-race")).toBe(true)
+        }).pipe(provide),
+    )
+
+    it.effect("the same race under a caller condition cancels the transaction", () =>
+      Effect.gen(function* () {
+        yield* Users.put({
+          userId: "u-race-c",
+          email: "racec-a@test.com",
+          displayName: "Race",
+          role: "member",
+          createdBy: "test",
+        }).asEffect()
+
+        const err = yield* raceAfterFirstRead(
+          Users.update({ userId: "u-race-c" })
+            .pipe(Entity.set({ email: "racec-b@test.com" }))
+            .asEffect(),
+          Transaction.transactWrite([
+            Users.delete({ userId: "u-race-c" }).pipe(Users.condition({ role: "member" })),
+            txTask("t-race-c"),
+          ]),
+        ).pipe(Effect.flip)
+
+        // A cancelled guard cannot be told apart from the caller's condition,
+        // so it is not retried — exactly as for a guarded put.
+        expect(err._tag).toBe("TransactionCancelled")
+        const user = yield* Users.get({ userId: "u-race-c" }).asEffect()
+        expect(user.email).toBe("racec-b@test.com")
+        expect(yield* sentinelOwner("racec-b@test.com")).toBe(
+          "$connected-test#v1#user#userid_u-race-c",
+        )
+        expect(yield* taskExists("t-race-c")).toBe(false)
+      }).pipe(provide),
+    )
+
+    it.effect("an unversioned update raced on an unrelated field commits and keeps it", () =>
+      Effect.gen(function* () {
+        yield* Vehicles.create({
+          vehicleId: "veh-race",
+          accountId: "acct-race",
+          name: "before",
+          deviceBinding: "dev-a",
+        }).asEffect()
+
+        // Renaming touches `nameInAccount`, so the plan reads the row. A
+        // concurrent rebind lands in between. The update writes only what it
+        // changes, so the rebind survives and nothing needs retrying.
+        yield* raceAfterFirstRead(
+          Vehicles.update({ vehicleId: "veh-race" })
+            .pipe(Entity.set({ deviceBinding: "dev-b" }))
+            .asEffect(),
+          Transaction.transactWrite([
+            Vehicles.update({ vehicleId: "veh-race" }).pipe(Entity.set({ name: "after" })),
+            txTask("t-race-veh"),
+          ]),
+        )
+
+        const vehicle = yield* Vehicles.get({ vehicleId: "veh-race" }).asEffect()
+        expect(vehicle.name).toBe("after")
+        expect(vehicle.deviceBinding).toBe("dev-b")
+        expect(yield* taskExists("t-race-veh")).toBe(true)
       }).pipe(provide),
     )
 
@@ -2059,43 +2326,37 @@ describeConnected("Connected integration tests", () => {
       }).pipe(provide),
     )
 
-    it.effect("a softDelete entity's transact delete is refused, not hard-deleted (#113)", () =>
-      Effect.gen(function* () {
-        // `Tasks` is softDelete. Before #113 this hard-deleted the row, losing
-        // the tombstone the entity was configured to write.
-        yield* Tasks.put({
-          taskId: "t-sd",
-          userId: "u-sd",
-          title: "Soft",
-          status: "todo",
-          priority: 1,
-        }).asEffect()
+    it.effect(
+      "a softDelete entity's transact delete writes the tombstone, not a hard delete (#113)",
+      () =>
+        Effect.gen(function* () {
+          // `Tasks` is softDelete. Before #113 this hard-deleted the row, losing
+          // the tombstone; then it was refused (EDD-9048). It now runs the
+          // entity's own delete with its write recorded, and writes that.
+          yield* Tasks.put({
+            taskId: "t-sd",
+            userId: "u-sd",
+            title: "Soft",
+            status: "todo",
+            priority: 1,
+          }).asEffect()
 
-        const err = yield* Transaction.transactWrite([Tasks.delete({ taskId: "t-sd" })]).pipe(
-          Effect.flip,
-        )
-        expect(err._tag).toBe("ValidationError")
-        expect(String((err as ValidationError).cause)).toContain("EDD-9048")
+          yield* Transaction.transactWrite([Tasks.delete({ taskId: "t-sd" })])
 
-        // Still live — nothing was deleted.
-        const still = yield* Tasks.get({ taskId: "t-sd" }).asEffect()
-        expect(still.title).toBe("Soft")
-
-        // The entity's own delete does write the tombstone, with GSI keys stripped.
-        yield* Tasks.delete({ taskId: "t-sd" })
-        const client = yield* DynamoClient
-        const partition = yield* client.query({
-          TableName: tableName,
-          KeyConditionExpression: "#pk = :pk",
-          ExpressionAttributeNames: { "#pk": "pk" },
-          ExpressionAttributeValues: { ":pk": { S: "$connected-test#v1#task#taskid_t-sd" } },
-        })
-        const rows = partition.Items ?? []
-        expect(rows).toHaveLength(1)
-        expect(rows[0]?.sk?.S).toContain("#deleted#")
-        expect(rows[0]?.deletedAt?.S).toBeDefined()
-        expect(rows[0]?.gsi1pk).toBeUndefined()
-      }).pipe(provide),
+          // One row left in the partition: the tombstone, with GSI keys stripped.
+          const client = yield* DynamoClient
+          const partition = yield* client.query({
+            TableName: tableName,
+            KeyConditionExpression: "#pk = :pk",
+            ExpressionAttributeNames: { "#pk": "pk" },
+            ExpressionAttributeValues: { ":pk": { S: "$connected-test#v1#task#taskid_t-sd" } },
+          })
+          const rows = partition.Items ?? []
+          expect(rows).toHaveLength(1)
+          expect(rows[0]?.sk?.S).toContain("#deleted#")
+          expect(rows[0]?.deletedAt?.S).toBeDefined()
+          expect(rows[0]?.gsi1pk).toBeUndefined()
+        }).pipe(provide),
     )
 
     it.effect("Batch.write refuses the lifecycle configs it cannot express (#113)", () =>

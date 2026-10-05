@@ -2207,8 +2207,12 @@ would accept is never refused, must not pass 4 MB =
 the binary megabytes of all its size limits). A retain put counts twice: its
 item and its snapshot. An oversized transaction is a `ValidationError` naming
 its largest item, not DynamoDB's bare `ValidationException`. Deletes of `unique` / retain / `softDelete`
-entities are still refused (EDD-9048): a transaction builds a delete from its
-key alone.
+entities, and updates, are planned by `Transaction.transactWrite` from the
+entity's own op (`Entity._planUpdate` / `_planDelete`): the op runs with its
+write recorded instead of sent (`internal/TransactPlan.planWrite`), and its
+items join the transaction as a guarded write, read by the same verdict
+contract as a guarded put. `EventStore.append` plans none, and still refuses
+those deletes (EDD-9048).
 
 **`Batch.write` of a `versioned` entity.** A `PutRequest` would reset an
 existing item to version 1 under a new incarnation. So `Batch.write` sends these
@@ -3668,7 +3672,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9056` | `Aggregate.ts` | A nested sub-aggregate binding declares a discriminator attribute it already inherits from an enclosing binding — the inner value would overwrite the outer one on the inner rows, so the parent's bindings could no longer be told apart. Use a distinct attribute name (e.g. `{ squadNo: 1 }` inside `{ clubNo: 1 }`) |
 | `EDD-9057` | `internal/EntitySchemas.ts` | A `DynamoModel.configure` `storedAs` override on a union field with more than one self-date member — the override cannot say which member it applies to. Annotate the intended member with `.pipe(DynamoModel.storedAs(...))` instead |
 | `EDD-9058` | `internal/EntitySchemas.ts` | A union's self-date member is stored as an epoch number next to a member also stored as a number (`Number`, a number literal, `BigInt`, another epoch date) — a stored number could belong to either, so it cannot be read back reliably. On aggregates a member whose DOMAIN is numeric (`NumberFromString`, `BigIntFromString`) is rejected too, since `update` re-decodes domain values. Store the date as a string, or remove the numeric member |
-| `EDD-9059`–`EDD-9061` | — | **Reserved** for PR #129 (`transactWrite` updates). Do not allocate |
+| `EDD-9059` | `internal/TransactableOps.ts` | An `update` with `.cascade(...)` in a transaction — a cascade is a follow-up write to other entities after the update commits, so it cannot share the transaction |
+| `EDD-9060` | `internal/TransactableOps.ts` | `.returnValues(...)` returning an item on an `update` or `delete` in a transaction — a transaction returns no item attributes, so the mode would be dropped |
+| `EDD-9061` | `internal/TransactableOps.ts` | An `update` of an entity with `vectorIndexes` in a transaction — recomputing the embedding needs the `Embedder` service, which the transact path does not provide |
 | `EDD-9062` | `EventStore.ts` | `snapshot.mode` is neither `"after-append"` nor `"inline"` |
 | `EDD-9063` | `EventStore.ts` | Malformed stream index: a `type` other than `"lsi"` / `"gsi"`, a `gsi` without `pk`, an `lsi` with `pk`, an empty `index` / `sk` / `pk`, or a `key` that is not a function |
 | `EDD-9064` | `EventStore.ts` | A stream index attribute collides with an attribute the stream writes itself (`pk`, `sk`, `__edd_e__`, `streamId`, `version`, `eventType`, `data`, `metadata`, `timestamp`, `asOfVersion`, `state`, `commandId`, `_ttl`) |

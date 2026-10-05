@@ -12,6 +12,7 @@ import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Schema } from "effect"
 import type { Entity } from "../Entity.js"
 import { toAttributeMap } from "../Marshaller.js"
+import type { ReturnValuesMode, UpdateState } from "./EntityOps.js"
 
 /**
  * @internal Hidden per-incarnation token of a versioned entity (#133): set
@@ -152,12 +153,21 @@ export const batchRejectReason = (entity: Entity, opType: "put" | "delete"): str
  *   planned exactly as `Entity.put` plans it (#133): the item is read, and the
  *   Put is guarded on what was read, beside its sentinel reservations and
  *   (owned) releases and its retain snapshot (`Entity._planPut`).
- * - **delete** — rejected with **EDD-9048**. The sentinel to release is keyed by
- *   the *stored* item's unique values, a retain snapshot copies the *stored* row,
- *   and a soft-delete tombstone IS the stored row relocated to a new sort key;
- *   the transaction path builds a delete from its key alone.
+ * - **delete** — the sentinel to release is keyed by the *stored* item's unique
+ *   values, a retain snapshot copies the *stored* row, and a soft-delete
+ *   tombstone IS the stored row relocated to a new sort key. `Transaction.
+ *   transactWrite` plans such a delete from a read (`Entity._planDelete`);
+ *   a path that builds a delete from its key alone (`EventStore.append`)
+ *   rejects it with **EDD-9048**.
  *
  * `Batch.write` rejects BOTH directions (**EDD-9049**) — see `batchRejectReason`.
+ *
+ * **What a planned update or delete cannot carry** (`Transaction.transactWrite`
+ * runs the op with its write recorded, so nothing after the write runs): a
+ * cascade (**EDD-9059** — a follow-up write after the update commits), a
+ * `returnValues` mode that returns an item (**EDD-9060** — a transaction
+ * returns no item attributes), and an update of a vector-indexed entity
+ * (**EDD-9061** — the embedding needs the `Embedder` service).
  *
  * `capability` names what the caller would have to give up, so the message can
  * say why rather than just "unsupported".
@@ -165,7 +175,7 @@ export const batchRejectReason = (entity: Entity, opType: "put" | "delete"): str
 export const rejectUnsupportedOp = (
   entity: Entity,
   operation: string,
-  opType: "put" | "delete",
+  opType: "put" | "update" | "delete",
   putKind: "put" | "create" | "upsert" | undefined,
   /**
    * The op's own input, for the one gate whose dependency the caller can
@@ -173,6 +183,17 @@ export const rejectUnsupportedOp = (
    * for any caller with none to offer — both read as "the field is absent".
    */
   input?: unknown,
+  details?: {
+    /** An update's accumulated state (`.cascade()`, `.returnValues()`, …). */
+    readonly updateState?: UpdateState | undefined
+    /** A delete's `.returnValues()`. */
+    readonly returnValues?: ReturnValuesMode | undefined
+    /**
+     * The caller reads the stored row before compiling (`transactWrite`'s
+     * pre-pass), so a multi-item delete is buildable and EDD-9048 does not apply.
+     */
+    readonly readsStoredRow?: boolean | undefined
+  },
 ): Effect.Effect<void, ValidationError> => {
   const fail = (capability: string, reason: string) =>
     new ValidationError({
@@ -193,9 +214,44 @@ export const rejectUnsupportedOp = (
     )
   }
 
+  // --- what a planned write cannot carry (EDD-9059 – EDD-9061) -------------
+  if (opType === "update" && details?.updateState?.cascade !== undefined) {
+    return Effect.fail(
+      fail(
+        "[EDD-9059] cascade",
+        "a cascade is a follow-up write to other entities after the update commits, so it " +
+          "cannot share the transaction. Run the update as its own operation.",
+      ),
+    )
+  }
+  const returnValues =
+    opType === "update" ? details?.updateState?.returnValues : details?.returnValues
+  if (opType !== "put" && returnValues !== undefined && returnValues !== "none") {
+    return Effect.fail(
+      fail(
+        "[EDD-9060] returnValues",
+        `a transaction returns no item attributes. Run the ${opType} as its own operation ` +
+          "to read them.",
+      ),
+    )
+  }
+  if (opType === "update" && Object.keys(entity._vectorIndexes ?? {}).length > 0) {
+    return Effect.fail(
+      fail(
+        "[EDD-9061] updating an entity with vector indexes",
+        "recomputing the embedding calls the Embedder service, which this path does not " +
+          "provide. Run the update as its own operation.",
+      ),
+    )
+  }
+
   // --- multi-item lifecycle, delete direction (EDD-9048) -------------------
   // The put direction is EXPANDED instead — see the doc comment.
-  if (opType === "delete" && entity._multiItemWriteFeatures.length > 0) {
+  if (
+    opType === "delete" &&
+    details?.readsStoredRow !== true &&
+    entity._multiItemWriteFeatures.length > 0
+  ) {
     return Effect.fail(
       fail(
         `[EDD-9048] deleting an entity configured with ${describeFeatures(entity._multiItemWriteFeatures)}`,
@@ -203,7 +259,8 @@ export const rejectUnsupportedOp = (
           "to release is keyed by its unique values, a retain snapshot copies it, and a " +
           "soft-delete tombstone is that row relocated to a new sort key. This path builds a " +
           "delete from its key alone, so it cannot build them. Run the delete as its own operation " +
-          "(db.entities.X.delete(...)), which reads the item first.",
+          "(db.entities.X.delete(...)) or through Transaction.transactWrite, both of which " +
+          "read the item first.",
       ),
     )
   }
