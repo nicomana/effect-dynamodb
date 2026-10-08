@@ -80,6 +80,11 @@ const conditionOf = (input: {
   }),
 })
 
+const conditionOfItem = (item: TransactWriteItem): string | undefined =>
+  item.Put?.ConditionExpression ??
+  item.Update?.ConditionExpression ??
+  item.Delete?.ConditionExpression
+
 const asPut = (input: PutItemCommandInput): TransactWriteItem => ({
   Put: { TableName: input.TableName, Item: input.Item, ...conditionOf(input) },
 })
@@ -117,10 +122,23 @@ export const planWrite = <A, E, R>(
    * as `ownRow`, so a plan can describe what it would reserve.
    */
   ownKey: Record<string, AttributeValue>,
+  options?: {
+    /**
+     * The row is known to be missing. A write the op guards on the row's
+     * existence is answered as DynamoDB would answer it — a
+     * `ConditionalCheckFailedException` with no stored item — instead of
+     * being recorded, so the op takes its own missing-row path: `update`'s
+     * create fallback, `ItemNotFound`, or `patch`'s `ConditionalCheckFailed`.
+     * Whatever it writes after that is recorded as usual.
+     */
+    readonly rowMissing?: boolean | undefined
+  },
 ): Effect.Effect<
   {
     readonly items: ReadonlyArray<TransactWriteItem>
     readonly ownRow: Record<string, AttributeValue> | undefined
+    /** Whether the op read its own row (so `ownRow` says whether it exists). */
+    readonly readOwnRow: boolean
   },
   E,
   R | DynamoClient
@@ -129,12 +147,24 @@ export const planWrite = <A, E, R>(
     const real = yield* DynamoClient
     let recorded: ReadonlyArray<TransactWriteItem> | undefined
     let wroteTwice = false
+    let missingAnswered = false
+    let readOwnRow = false
     let ownRow: Record<string, AttributeValue> | undefined
     const isOwnKey = (key: Record<string, AttributeValue> | undefined) =>
       key !== undefined &&
       Object.keys(ownKey).length === Object.keys(key).length &&
       Object.entries(ownKey).every(([name, value]) => key[name]?.S === value.S)
     const record = (name: string, items: ReadonlyArray<TransactWriteItem>) => {
+      const guarded = items.length === 1 && conditionOfItem(items[0]!) !== undefined
+      if (options?.rowMissing === true && !missingAnswered && guarded) {
+        missingAnswered = true
+        return Effect.fail(
+          new DynamoError({
+            operation: name,
+            cause: { name: "ConditionalCheckFailedException" },
+          }),
+        )
+      }
       if (recorded !== undefined) {
         wroteTwice = true
         return Effect.die(new UnplannableWrite(operation))
@@ -150,7 +180,9 @@ export const planWrite = <A, E, R>(
         real.getItem(input).pipe(
           Effect.tap((output) =>
             Effect.sync(() => {
-              if (isOwnKey(input.Key) && output.Item !== undefined) ownRow = output.Item
+              if (!isOwnKey(input.Key)) return
+              readOwnRow = true
+              if (output.Item !== undefined) ownRow = output.Item
             }),
           ),
         ),
@@ -164,7 +196,7 @@ export const planWrite = <A, E, R>(
     // Checked first: the op may have swallowed the defect, but a plan of only
     // its first write would silently drop the second.
     if (wroteTwice) return yield* Effect.die(new UnplannableWrite(operation))
-    if (recorded !== undefined) return { items: recorded, ownRow }
+    if (recorded !== undefined) return { items: recorded, ownRow, readOwnRow }
     if (Exit.isFailure(exit)) return yield* Effect.failCause(exit.cause)
-    return { items: [], ownRow }
+    return { items: [], ownRow, readOwnRow }
   })

@@ -18,17 +18,20 @@ sentinel rotations and owned releases, the retain snapshot and the soft-delete
 tombstone. Every read the standalone op makes still happens, so its outcomes
 surface before anything is sent: `ItemNotFound`, `ConditionalCheckFailed`
 (`patch` of a missing item), `OptimisticLockError` (a stale `expectedVersion`)
-and `RefNotFound`. Because the transactional write is the standalone write, the
+and `RefNotFound`. A plain update, which standalone relies on its write's own
+condition to find a missing row, is checked with one read instead, and a missing
+row takes the op's own path: a complete `.set()` is planned as its create. Because the transactional write is the standalone write, the
 two cannot drift.
 
 The recorded items join the transaction as a guarded write and are read the way
 a guarded put's are:
 
 - A taken unique value is `UniqueConstraintViolation`.
-- A cancelled main item is `TransactionCancelled` when the caller set a
-  condition (`.condition()`, `patch`, `deleteIfExists`).
+- A cancelled main item is `TransactionCancelled` when the caller's own
+  `.condition()` rejected a row that is still there.
 - Any other cancellation is a lost race, which is planned again from a fresh
-  read.
+  read. A row deleted meanwhile then takes the op's missing-row path, and a
+  pinned `expectedVersion` it no longer has fails `OptimisticLockError`.
 
 A transaction whose updates all resolve to no write sends nothing, as the
 standalone no-op update does.

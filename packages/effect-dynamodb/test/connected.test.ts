@@ -2082,6 +2082,43 @@ describeConnected("Connected integration tests", () => {
       }).pipe(provide),
     )
 
+    it.effect("a complete update of a missing row creates it inside the transaction", () =>
+      Effect.gen(function* () {
+        // `Memberships` takes the plain update path (no read, no unique). Its
+        // standalone update finds the row missing through its own condition
+        // and falls back to create — the transaction writes that create.
+        yield* Transaction.transactWrite([
+          Memberships.update({ orgId: "org-tx", userId: "u-tx-new" }).pipe(
+            Entity.set({
+              orgId: "org-tx",
+              userId: "u-tx-new",
+              role: "member",
+              joinedAt: "2026-10-07",
+            }),
+          ),
+          txTask("t-tx-create"),
+        ])
+
+        const created = yield* Memberships.get({ orgId: "org-tx", userId: "u-tx-new" }).asEffect()
+        expect(created.role).toBe("member")
+        expect(yield* taskExists("t-tx-create")).toBe(true)
+      }).pipe(provide),
+    )
+
+    it.effect("a patch of a missing row fails before sending and writes nothing", () =>
+      Effect.gen(function* () {
+        const err = yield* Transaction.transactWrite([
+          Memberships.patch({ orgId: "org-tx", userId: "u-tx-ghost" }).pipe(
+            Entity.set({ role: "admin" }),
+          ),
+          txTask("t-tx-ghost"),
+        ]).pipe(Effect.flip)
+
+        expect(err._tag).toBe("ConditionalCheckFailed")
+        expect(yield* taskExists("t-tx-ghost")).toBe(false)
+      }).pipe(provide),
+    )
+
     it.effect("a retain entity's transactional update bumps the version and snapshots it", () =>
       Effect.gen(function* () {
         yield* Users.put({

@@ -3,6 +3,7 @@ import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   DynamoError,
+  type OptimisticLockError,
   type TransactionCancelled,
   type UniqueConstraintViolation,
   type ValidationError,
@@ -167,6 +168,32 @@ const SoftNotes = Entity.make({
   softDelete: true,
 })
 
+class VersionedNote extends Schema.Class<VersionedNote>("VersionedNote")({
+  noteId: Schema.String,
+  body: Schema.String,
+}) {}
+
+/** Versioned without retain: a plain update writes without reading first. */
+const VersionedNotes = Entity.make({
+  model: VersionedNote,
+  entityType: "VersionedNote",
+  primaryKey: { pk: { field: "pk", composite: ["noteId"] }, sk: { field: "sk", composite: [] } },
+  versioned: true,
+})
+
+class Ticket extends Schema.Class<Ticket>("Ticket")({
+  ticketId: Schema.String,
+  seq: Schema.Number,
+}) {}
+
+/** A numeric unique field, changed by `.add()`. */
+const Tickets = Entity.make({
+  model: Ticket,
+  entityType: "Ticket",
+  primaryKey: { pk: { field: "pk", composite: ["ticketId"] }, sk: { field: "sk", composite: [] } },
+  unique: { seq: ["seq"] },
+})
+
 class VectorDoc extends Schema.Class<VectorDoc>("VectorDoc")({
   docId: Schema.String,
   body: Schema.String,
@@ -194,6 +221,8 @@ const MainTable = Table.make({
     RenamedMembers,
     SoftNotes,
     VectorDocs,
+    VersionedNotes,
+    Tickets,
   },
 })
 
@@ -1451,8 +1480,19 @@ describe("Transaction", () => {
         label: "L",
       })
 
-    it.effect("an update of a plain entity is one Update item, with no read", () =>
+    it.effect("an update of a plain entity is one Update item, after one existence read", () =>
       Effect.gen(function* () {
+        mockGetItem.mockImplementation(async () => ({
+          Item: toAttributeMap({
+            pk: "$myapp#v1#user#userid_u-1",
+            sk: "$myapp#v1#user",
+            __edd_e__: "User",
+            userId: "u-1",
+            email: "a@x.io",
+            name: "A",
+            role: "admin",
+          }),
+        }))
         mockTransactWriteItems.mockResolvedValueOnce({})
 
         yield* Transaction.transactWrite([
@@ -1466,7 +1506,10 @@ describe("Transaction", () => {
           }),
         ])
 
-        expect(mockGetItem).not.toHaveBeenCalled()
+        // One consistent read: the row must exist for the Update to apply —
+        // a missing one would take the update's own create / ItemNotFound path.
+        expect(mockGetItem).toHaveBeenCalledTimes(1)
+        expect(mockGetItem.mock.calls[0]![0].ConsistentRead).toBe(true)
         const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
         expect(items).toHaveLength(2)
         expect(fromAttributeMap(items[0].Update.Key).pk).toBe("$myapp#v1#user#userid_u-1")
@@ -1479,6 +1522,17 @@ describe("Transaction", () => {
     it.effect("a bound update from db.entities.* is accepted", () =>
       Effect.gen(function* () {
         const db = yield* DynamoClient.make({ entities: { UserEntity }, tables: { MainTable } })
+        mockGetItem.mockImplementation(async () => ({
+          Item: toAttributeMap({
+            pk: "$myapp#v1#user#userid_u-1",
+            sk: "$myapp#v1#user",
+            __edd_e__: "User",
+            userId: "u-1",
+            email: "a@x.io",
+            name: "A",
+            role: "admin",
+          }),
+        }))
         mockTransactWriteItems.mockResolvedValueOnce({})
 
         yield* Transaction.transactWrite([
@@ -1491,6 +1545,17 @@ describe("Transaction", () => {
 
     it.effect("patch() keeps its attribute_exists guard on the Update item", () =>
       Effect.gen(function* () {
+        mockGetItem.mockImplementation(async () => ({
+          Item: toAttributeMap({
+            pk: "$myapp#v1#user#userid_u-1",
+            sk: "$myapp#v1#user",
+            __edd_e__: "User",
+            userId: "u-1",
+            email: "a@x.io",
+            name: "A",
+            role: "admin",
+          }),
+        }))
         mockTransactWriteItems.mockResolvedValueOnce({})
 
         yield* Transaction.transactWrite([
@@ -1586,6 +1651,149 @@ describe("Transaction", () => {
         expect(error._tag).toBe("ValidationError")
         expect(String((error as ValidationError).cause)).toContain("[EDD-9061]")
         expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  describe("planned ops follow the standalone op's own paths", () => {
+    it.effect("a complete update of a missing row is planned as its create", () =>
+      Effect.gen(function* () {
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([
+          UserEntity.update({ userId: "u-new" }).pipe(
+            // Every required field and key composite: what `put` would write.
+            Entity.set({ userId: "u-new", email: "n@x.io", name: "New", role: "member" }),
+          ),
+        ])
+
+        const items = mockTransactWriteItems.mock.calls[0]![0].TransactItems
+        // The standalone update's guarded write would find the row missing and
+        // fall back to create — so the transaction writes the create.
+        expect(items).toHaveLength(1)
+        expect(items[0].Put).toBeDefined()
+        expect(fromAttributeMap(items[0].Put.Item).userId).toBe("u-new")
+        expect(items[0].Put.ConditionExpression).toContain("attribute_not_exists")
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("an incomplete update of a missing row fails ItemNotFound before sending", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([
+          UserEntity.update({ userId: "u-new" }).pipe(Entity.set({ name: "New" })),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ItemNotFound")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a patch of a missing row fails ConditionalCheckFailed before sending", () =>
+      Effect.gen(function* () {
+        const error = yield* Transaction.transactWrite([
+          UserEntity.patch({ userId: "u-new" }).pipe(Entity.set({ name: "New" })),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ConditionalCheckFailed")
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a stale expectedVersion on the plain path is refused before sending", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockImplementation(async () => ({
+          Item: toAttributeMap({
+            pk: "$myapp#v1#versionednote#noteid_n-1",
+            sk: "$myapp#v1#versionednote",
+            __edd_e__: "VersionedNote",
+            noteId: "n-1",
+            body: "b",
+            version: 3,
+          }),
+        }))
+
+        const error = yield* Transaction.transactWrite([
+          VersionedNotes.update({ noteId: "n-1" }).pipe(
+            Entity.set({ body: "b2" }),
+            Entity.expectedVersion(2),
+          ),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("OptimisticLockError")
+        expect((error as OptimisticLockError).actualVersion).toBe(3)
+        expect(mockTransactWriteItems).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("deleteIfExists' own guard is not a caller condition: a race is retried", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockImplementation(async (input: any) =>
+          fromAttributeMap(input.Key).sk === "$myapp#v1#lifecyclemember"
+            ? {
+                Item: toAttributeMap({
+                  pk: "$myapp#v1#lifecyclemember#memberid_m-1",
+                  sk: "$myapp#v1#lifecyclemember",
+                  __edd_e__: "LifecycleMember",
+                  memberId: "m-1",
+                  email: "a@x.io",
+                  label: "L",
+                  version: 1,
+                }),
+              }
+            : {},
+        )
+        // First attempt: the row changed under the guard (it is still there).
+        mockTransactWriteItems.mockImplementationOnce(async (input: any) => {
+          const error = new Error("cancelled")
+          ;(error as any).name = "TransactionCanceledException"
+          ;(error as any).CancellationReasons = input.TransactItems.map((i: any) =>
+            i.Delete && fromAttributeMap(i.Delete.Key).sk === "$myapp#v1#lifecyclemember"
+              ? { Code: "ConditionalCheckFailed", Item: toAttributeMap({ version: 2 }) }
+              : { Code: "None" },
+          )
+          throw error
+        })
+        mockTransactWriteItems.mockResolvedValueOnce({})
+
+        yield* Transaction.transactWrite([LifecycleMembers.deleteIfExists({ memberId: "m-1" })])
+
+        expect(mockTransactWriteItems).toHaveBeenCalledTimes(2)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a unique value reached by .add() is reported with its new value", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockImplementation(async (input: any) =>
+          fromAttributeMap(input.Key).sk === "$myapp#v1#ticket"
+            ? {
+                Item: toAttributeMap({
+                  pk: "$myapp#v1#ticket#ticketid_t-1",
+                  sk: "$myapp#v1#ticket",
+                  __edd_e__: "Ticket",
+                  ticketId: "t-1",
+                  seq: 5,
+                }),
+              }
+            : {},
+        )
+        mockTransactWriteItems.mockImplementationOnce(async (input: any) => {
+          const error = new Error("cancelled")
+          ;(error as any).name = "TransactionCanceledException"
+          ;(error as any).CancellationReasons = input.TransactItems.map((i: any) =>
+            i.Put && fromAttributeMap(i.Put.Item).__edd_e__ === "Ticket._unique.seq"
+              ? { Code: "ConditionalCheckFailed" }
+              : { Code: "None" },
+          )
+          throw error
+        })
+
+        const error = yield* Transaction.transactWrite([
+          Tickets.update({ ticketId: "t-1" }).pipe(Entity.add({ seq: 1 })),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("UniqueConstraintViolation")
+        // 5 + 1, in the library's serialized (padded) form — not `{}`.
+        expect((error as UniqueConstraintViolation).fields).toEqual({ seq: "0000000000000006" })
       }).pipe(Effect.provide(TestLayer)),
     )
   })

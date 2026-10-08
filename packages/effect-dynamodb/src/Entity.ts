@@ -7092,14 +7092,57 @@ const makeImpl = <
   const planned = <E, R>(
     operation: string,
     key: unknown,
-    effect: Effect.Effect<unknown, E, R>,
-    payload: globalThis.Record<string, unknown>,
-    callerCondition: boolean,
+    /** The op itself — a factory, because a missing row means running it again. */
+    op: () => Effect.Effect<unknown, E, R>,
+    request: {
+      readonly payload: globalThis.Record<string, unknown>
+      /** Values `.add()` / `.subtract()` change by, for the reported reservation. */
+      readonly deltas?: globalThis.Record<string, number> | undefined
+      /** The caller's own `.condition()` — not `patch`'s or `deleteIfExists`'s guard. */
+      readonly callerCondition: boolean
+      readonly expectedVersion?: number | undefined
+    },
   ) =>
     Effect.gen(function* () {
       const encodedKey = yield* encodeKey(key, `${operation}.decodeKey`)
       const primaryKey = composePrimaryKey(encodedKey)
-      const { items, ownRow } = yield* planWrite(operation, effect, toAttributeMap(primaryKey))
+      const ownKey = toAttributeMap(primaryKey)
+      const recorded = yield* planWrite(operation, op(), ownKey)
+      let { items, ownRow } = recorded
+      // An op that wrote without reading its row relies on its write's own
+      // condition to find the row missing — a standalone `update` then
+      // creates it (or fails `ItemNotFound`), `patch` fails
+      // `ConditionalCheckFailed`. A transaction cannot follow that fallback,
+      // so the row is read here, and a missing row is answered to the op as
+      // its write would have been answered: it takes the same path.
+      if (!recorded.readOwnRow && items.length > 0) {
+        const client = yield* DynamoClient
+        const { name: tableName } = yield* tableTag
+        const read = yield* client.getItem({
+          TableName: tableName,
+          Key: ownKey,
+          ConsistentRead: true,
+        })
+        if (read.Item === undefined) {
+          ;({ items, ownRow } = yield* planWrite(operation, op(), ownKey, { rowMissing: true }))
+        } else {
+          ownRow = read.Item
+          // A pinned version the row no longer has is refused before sending,
+          // as the read-first paths do — not retried as if it were a race.
+          if (request.expectedVersion !== undefined && systemFields.version) {
+            const stored = fromAttributeMap(read.Item)[systemFields.version]
+            const actual = typeof stored === "number" ? stored : 0
+            if (actual !== request.expectedVersion) {
+              return yield* new OptimisticLockError({
+                entityType,
+                key: encodedKey,
+                expectedVersion: request.expectedVersion,
+                actualVersion: actual,
+              })
+            }
+          }
+        }
+      }
       const pkField = config.indexes.primary.pk.field
       const skField = config.indexes.primary.sk.field
       const isOwn = (row: globalThis.Record<string, AttributeValue> | undefined) => {
@@ -7111,13 +7154,17 @@ const makeImpl = <
       // Put's item when the op writes the whole row, else the row it read
       // overlaid with the payload.
       const mainPut = items.find((i) => i.Put !== undefined && isOwn(i.Put.Item))?.Put?.Item
-      const after =
+      const read = ownRow === undefined ? {} : toDomainView(fromAttributeMap(ownRow))
+      const after: globalThis.Record<string, unknown> =
         mainPut !== undefined
           ? toDomainView(fromAttributeMap(mainPut))
-          : {
-              ...(ownRow === undefined ? {} : toDomainView(fromAttributeMap(ownRow))),
-              ...payload,
-            }
+          : { ...read, ...request.payload }
+      if (mainPut === undefined) {
+        for (const [field, delta] of Object.entries(request.deltas ?? {})) {
+          const base = read[field]
+          after[field] = (typeof base === "number" ? base : 0) + delta
+        }
+      }
       const sentinelPrefix = `${entityType}._unique.`
       type Role =
         | { readonly _tag: "main" }
@@ -7163,17 +7210,27 @@ const makeImpl = <
       })
       return {
         items,
+        // Everything but a taken unique value and the caller's own condition
+        // is retried, and every attempt plans again from fresh reads — so a
+        // row now missing takes the op's missing-row path, and a pinned
+        // version the row no longer has fails `OptimisticLockError`, exactly
+        // as standalone.
         verdict: (reasons) => {
-          let mainFailed = false
-          let otherFailed = false
+          let failed = false
+          let callerRejected = false
           for (const [i, role] of roles.entries()) {
-            if (reasons[i]?.Code !== "ConditionalCheckFailed") continue
+            const reason = reasons[i]
+            if (reason?.Code !== "ConditionalCheckFailed") continue
             if (role._tag === "reserve") return { _tag: "Fail", error: role.error }
-            if (role._tag === "main") mainFailed = true
-            else otherFailed = true
+            failed = true
+            // The row is there, so the existence guards held: only the
+            // caller's own condition can have rejected it — or a race.
+            if (role._tag === "main" && request.callerCondition && reason.Item !== undefined) {
+              callerRejected = true
+            }
           }
-          if (!mainFailed && !otherFailed) return undefined
-          if (mainFailed && callerCondition) return { _tag: "Condition" }
+          if (!failed) return undefined
+          if (callerRejected) return { _tag: "Condition" }
           return { _tag: "Retry", stored: undefined, error: lostRace }
         },
       } satisfies TransactPlan
@@ -7181,13 +7238,17 @@ const makeImpl = <
 
   /** Compile an update for `Transaction.transactWrite` — see `_planUpdate`. */
   const planUpdate = (key: unknown, uState: UpdateState) =>
-    planned(
-      "transactWrite.update",
-      key,
-      updateOrCreate(key, "native", uState),
-      (uState.updates ?? {}) as globalThis.Record<string, unknown>,
-      uState.condition !== undefined || uState.patch === true,
-    )
+    planned("transactWrite.update", key, () => updateOrCreate(key, "native", uState), {
+      payload: (uState.updates ?? {}) as globalThis.Record<string, unknown>,
+      deltas: {
+        ...uState.add,
+        ...Object.fromEntries(
+          Object.entries(uState.subtract ?? {}).map(([field, by]) => [field, -by]),
+        ),
+      },
+      callerCondition: uState.condition !== undefined,
+      expectedVersion: uState.expectedVersion,
+    })
 
   // ---------------------------------------------------------------------------
   // delete operation
@@ -7740,9 +7801,8 @@ const makeImpl = <
     planned(
       "transactWrite.delete",
       key,
-      del(key)._builder({ ...opts, returnValues: undefined }),
-      {},
-      opts.condition !== undefined || opts.mustExist,
+      () => del(key)._builder({ ...opts, returnValues: undefined }),
+      { payload: {}, callerCondition: opts.condition !== undefined },
     )
 
   const deleteIfExists = (key: unknown) => {

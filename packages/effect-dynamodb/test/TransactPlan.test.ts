@@ -92,6 +92,41 @@ describe("planWrite", () => {
     }).pipe(Effect.provide(TestClient)),
   )
 
+  it.effect("with rowMissing, a guarded write is answered as a missing row, not recorded", () =>
+    Effect.gen(function* () {
+      const plan = yield* planWrite(
+        "test",
+        Effect.gen(function* () {
+          const client = yield* DynamoClient
+          // The op's guarded write — answered as DynamoDB would on a missing row…
+          const first = yield* Effect.flip(
+            client.updateItem({
+              TableName: "t",
+              Key: ownKey,
+              UpdateExpression: "SET #a = :a",
+              ConditionExpression: "attribute_exists(#pk)",
+              ExpressionAttributeNames: { "#a": "label", "#pk": "pk" },
+              ExpressionAttributeValues: { ":a": { S: "L2" } },
+            }),
+          )
+          expect((first.cause as { name: string }).name).toBe("ConditionalCheckFailedException")
+          // …so it falls back, and that write is what gets recorded.
+          yield* client.putItem({
+            TableName: "t",
+            Item: ownRow,
+            ConditionExpression: "attribute_not_exists(#pk)",
+            ExpressionAttributeNames: { "#pk": "pk" },
+          })
+        }),
+        ownKey,
+        { rowMissing: true },
+      )
+      expect(plan.items).toHaveLength(1)
+      expect(plan.items[0]!.Put).toBeDefined()
+      expect(plan.readOwnRow).toBe(false)
+    }).pipe(Effect.provide(TestClient)),
+  )
+
   it.effect("a second write is a defect — the op could not have been one atomic write", () =>
     Effect.gen(function* () {
       const exit = yield* planWrite(
