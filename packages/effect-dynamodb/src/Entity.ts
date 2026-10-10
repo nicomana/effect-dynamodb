@@ -70,6 +70,7 @@ import {
 } from "effect"
 import { DynamoClient, type DynamoClientError } from "./DynamoClient.js"
 import type { ConditionInput } from "./Expression.js"
+import { attributeValueEquals } from "./internal/AttributeValueEquals.js"
 import {
   isBoundOp,
   makeBoundAppend,
@@ -446,51 +447,6 @@ const expressionFits = (
 ): boolean => {
   const cost = expressionCost(expression, kind)
   return cost.length <= EXPRESSION_LIMIT && cost.operators <= OPERATOR_LIMIT
-}
-
-const bytesKey = (bytes: Uint8Array): string => Array.from(bytes).join(",")
-
-/** Structural equality of two marshalled values (sets compare as sets). */
-const attributeValueEquals = (
-  a: AttributeValue | undefined,
-  b: AttributeValue | undefined,
-): boolean => {
-  if (a === undefined || b === undefined) return a === b
-  const [kind] = Object.keys(a)
-  if (kind === undefined || Object.keys(b)[0] !== kind) return false
-  const x = (a as unknown as globalThis.Record<string, unknown>)[kind]
-  const y = (b as unknown as globalThis.Record<string, unknown>)[kind]
-  switch (kind) {
-    case "L": {
-      const xs = x as ReadonlyArray<AttributeValue>
-      const ys = y as ReadonlyArray<AttributeValue>
-      return xs.length === ys.length && xs.every((v, i) => attributeValueEquals(v, ys[i]))
-    }
-    case "M": {
-      const xm = x as globalThis.Record<string, AttributeValue>
-      const ym = y as globalThis.Record<string, AttributeValue>
-      const keys = Object.keys(xm)
-      return (
-        keys.length === Object.keys(ym).length &&
-        keys.every((k) => attributeValueEquals(xm[k], ym[k]))
-      )
-    }
-    case "SS":
-    case "NS": {
-      const xs = new Set(x as ReadonlyArray<string>)
-      const ys = y as ReadonlyArray<string>
-      return xs.size === new Set(ys).size && ys.every((v) => xs.has(v))
-    }
-    case "B":
-      return bytesKey(x as Uint8Array) === bytesKey(y as Uint8Array)
-    case "BS": {
-      const xs = new Set((x as ReadonlyArray<Uint8Array>).map(bytesKey))
-      const ys = (y as ReadonlyArray<Uint8Array>).map(bytesKey)
-      return xs.size === new Set(ys).size && ys.every((v) => xs.has(v))
-    }
-    default:
-      return x === y
-  }
 }
 
 /**
@@ -7169,10 +7125,23 @@ const makeImpl = <
       type Role =
         | { readonly _tag: "main" }
         | { readonly _tag: "side" }
+        | { readonly _tag: "snapshot"; readonly version: number }
         | { readonly _tag: "reserve"; readonly error: UniqueConstraintViolation }
+      const versionPrefix = DynamoSchema.composeVersionKeyPrefix(schema, entityType)
       const roles = items.map((item): Role => {
         if (isOwn(item.Put?.Item) || isOwn(item.Update?.Key) || isOwn(item.Delete?.Key)) {
           return { _tag: "main" }
+        }
+        // A retain snapshot: in the row's partition, at a version key.
+        const putRow = item.Put?.Item === undefined ? undefined : fromAttributeMap(item.Put.Item)
+        const putSk = putRow?.[skField]
+        if (
+          putRow !== undefined &&
+          putRow[pkField] === primaryKey[pkField] &&
+          typeof putSk === "string" &&
+          putSk.startsWith(versionPrefix)
+        ) {
+          return { _tag: "snapshot", version: storedVersionOf(item.Put?.Item) ?? 0 }
         }
         const tag = item.Put?.Item?.__edd_e__?.S
         if (
@@ -7202,36 +7171,86 @@ const makeImpl = <
           error: new UniqueConstraintViolation({ entityType, constraint: constraintName, fields }),
         }
       })
-      const lostRace = new ConcurrentModification({
-        entityType,
-        key: encodedKey as globalThis.Record<string, unknown>,
-        attributes: [],
-        current: Option.none(),
-      })
+      // How a rejected main item reads, as a guarded put's does: compare the
+      // stored item the cancellation returns (`ALL_OLD`) with the row the
+      // plan was built from. Versioned: its version and incarnation.
+      // Otherwise: every attribute the main item's condition names — the
+      // op's own guard inputs are all among them, so if none changed the
+      // guard held, and only the caller's condition can have rejected it.
+      const mainItem = items[roles.findIndex((role) => role._tag === "main")]
+      const guarded = mainItem?.Update ?? mainItem?.Put ?? mainItem?.Delete
+      const conditionAttrs = [
+        ...new Set(
+          (guarded?.ConditionExpression?.match(/#[A-Za-z0-9_]+/g) ?? []).flatMap((token) => {
+            const attr = guarded?.ExpressionAttributeNames?.[token]
+            return attr === undefined ? [] : [attr]
+          }),
+        ),
+      ]
+      const readVersion = storedVersionOf(ownRow)
+      const changedFrom = (stored: globalThis.Record<string, AttributeValue>) =>
+        conditionAttrs.filter((attr) => !attributeValueEquals(stored[attr], ownRow?.[attr]))
+      const raced = (stored: globalThis.Record<string, AttributeValue>) =>
+        systemFields.version
+          ? storedVersionOf(stored) !== readVersion ||
+            (incarnationAttr !== undefined &&
+              !attributeValueEquals(stored[incarnationAttr], ownRow?.[incarnationAttr]))
+          : changedFrom(stored).length > 0
+      /** A lost race: the error once retries run out, as a guarded put reports it. */
+      const lostRace = (stored: globalThis.Record<string, AttributeValue> | undefined) =>
+        ({
+          _tag: "Retry",
+          stored,
+          error: systemFields.version
+            ? new OptimisticLockError({
+                entityType,
+                key: encodedKey,
+                expectedVersion: readVersion ?? 0,
+                actualVersion: storedVersionOf(stored) ?? -1,
+              })
+            : new ConcurrentModification({
+                entityType,
+                key: encodedKey as globalThis.Record<string, unknown>,
+                attributes: stored === undefined ? [] : changedFrom(stored).map(domainNameOf),
+                current: Option.none(),
+              }),
+        }) as const
       return {
         items,
-        // Everything but a taken unique value and the caller's own condition
-        // is retried, and every attempt plans again from fresh reads — so a
-        // row now missing takes the op's missing-row path, and a pinned
-        // version the row no longer has fails `OptimisticLockError`, exactly
-        // as standalone.
+        // A taken unique value fails; a snapshot the row's own history
+        // already holds fails (`historyConflict`, as standalone — re-reading
+        // will not change it); the caller's own condition rejecting an
+        // unchanged row is a condition. Everything else is a race, retried —
+        // and every attempt plans again from fresh reads, so a row now
+        // missing takes the op's missing-row path and a pinned version the
+        // row no longer has fails `OptimisticLockError`, as standalone.
         verdict: (reasons) => {
-          let failed = false
-          let callerRejected = false
+          let main: globalThis.Record<string, AttributeValue> | "absent" | undefined
+          let sideFailed = false
           for (const [i, role] of roles.entries()) {
             const reason = reasons[i]
             if (reason?.Code !== "ConditionalCheckFailed") continue
-            if (role._tag === "reserve") return { _tag: "Fail", error: role.error }
-            failed = true
-            // The row is there, so the existence guards held: only the
-            // caller's own condition can have rejected it — or a race.
-            if (role._tag === "main" && request.callerCondition && reason.Item !== undefined) {
-              callerRejected = true
+            switch (role._tag) {
+              case "reserve":
+                return { _tag: "Fail", error: role.error }
+              case "snapshot":
+                return ownRow === undefined
+                  ? lostRace(undefined)
+                  : { _tag: "Fail", error: historyConflict(role.version, operation) }
+              case "main":
+                main =
+                  reason.Item === undefined
+                    ? "absent"
+                    : (reason.Item as globalThis.Record<string, AttributeValue>)
+                break
+              case "side":
+                sideFailed = true
             }
           }
-          if (!failed) return undefined
-          if (callerRejected) return { _tag: "Condition" }
-          return { _tag: "Retry", stored: undefined, error: lostRace }
+          if (main === undefined) return sideFailed ? lostRace(undefined) : undefined
+          if (main === "absent") return lostRace(undefined)
+          if (raced(main) || !request.callerCondition) return lostRace(main)
+          return { _tag: "Condition" }
         },
       } satisfies TransactPlan
     })

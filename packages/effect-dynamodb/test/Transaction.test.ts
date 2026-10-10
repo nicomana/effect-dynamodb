@@ -1798,6 +1798,137 @@ describe("Transaction", () => {
     )
   })
 
+  describe("a cancelled planned write is judged like a guarded put", () => {
+    const userRow = (role: string) =>
+      toAttributeMap({
+        pk: "$myapp#v1#user#userid_u-1",
+        sk: "$myapp#v1#user",
+        __edd_e__: "User",
+        userId: "u-1",
+        email: "a@x.io",
+        name: "A",
+        role,
+      })
+    /** Cancel every attempt at the op's own row, returning `stored` as ALL_OLD. */
+    const cancelMainWith = (stored: Record<string, unknown> | undefined) =>
+      mockTransactWriteItems.mockImplementation(async (input: any) => {
+        const error = new Error("cancelled")
+        ;(error as any).name = "TransactionCanceledException"
+        // On the plain path the op's own row is the transaction's one Update.
+        ;(error as any).CancellationReasons = input.TransactItems.map((i: any) =>
+          i.Update
+            ? { Code: "ConditionalCheckFailed", ...(stored ? { Item: stored } : {}) }
+            : { Code: "None" },
+        )
+        throw error
+      })
+
+    it.effect(
+      "the caller's condition rejecting an unchanged row is TransactionCancelled, sent once",
+      () =>
+        Effect.gen(function* () {
+          mockGetItem.mockImplementation(async () => ({ Item: userRow("admin") }))
+          cancelMainWith(userRow("admin"))
+
+          const error = yield* Transaction.transactWrite([
+            UserEntity.update({ userId: "u-1" }).pipe(
+              Entity.set({ name: "Renamed" }),
+              UserEntity.condition({ role: "member" }),
+            ),
+          ]).pipe(Effect.flip)
+
+          expect(error._tag).toBe("TransactionCancelled")
+          // Not retried: nothing raced, so a fresh plan could only fail the same way.
+          expect(mockTransactWriteItems).toHaveBeenCalledTimes(1)
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "a conditioned attribute changed under the read is a race, not the caller's condition",
+      () =>
+        Effect.gen(function* () {
+          mockGetItem.mockImplementation(async () => ({ Item: userRow("admin") }))
+          // Every attempt finds `role` changed since the read: a race each time.
+          cancelMainWith(userRow("member"))
+
+          const error = yield* Transaction.transactWrite([
+            UserEntity.update({ userId: "u-1" }).pipe(
+              Entity.set({ name: "Renamed" }),
+              UserEntity.condition({ role: "admin" }),
+            ),
+          ]).pipe(Effect.flip)
+
+          expect(error._tag).toBe("ConcurrentModification")
+          expect((error as any).attributes).toContain("role")
+          expect(mockTransactWriteItems.mock.calls.length).toBeGreaterThan(1)
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect(
+      "a versioned race lost on every attempt is OptimisticLockError with both versions",
+      () =>
+        Effect.gen(function* () {
+          const note = (version: number) =>
+            toAttributeMap({
+              pk: "$myapp#v1#versionednote#noteid_n-1",
+              sk: "$myapp#v1#versionednote",
+              __edd_e__: "VersionedNote",
+              noteId: "n-1",
+              body: "b",
+              version,
+            })
+          mockGetItem.mockImplementation(async () => ({ Item: note(3) }))
+          cancelMainWith(note(4))
+
+          const error = yield* Transaction.transactWrite([
+            VersionedNotes.update({ noteId: "n-1" }).pipe(Entity.set({ body: "b2" })),
+          ]).pipe(Effect.flip)
+
+          expect(error._tag).toBe("OptimisticLockError")
+          expect((error as OptimisticLockError).expectedVersion).toBe(3)
+          expect((error as OptimisticLockError).actualVersion).toBe(4)
+        }).pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a retain snapshot the history already holds fails historyConflict, sent once", () =>
+      Effect.gen(function* () {
+        mockGetItem.mockImplementation(async (input: any) =>
+          fromAttributeMap(input.Key).sk === "$myapp#v1#lifecyclemember"
+            ? {
+                Item: toAttributeMap({
+                  pk: "$myapp#v1#lifecyclemember#memberid_m-1",
+                  sk: "$myapp#v1#lifecyclemember",
+                  __edd_e__: "LifecycleMember",
+                  memberId: "m-1",
+                  email: "a@x.io",
+                  label: "L",
+                  version: 2,
+                }),
+              }
+            : {},
+        )
+        mockTransactWriteItems.mockImplementation(async (input: any) => {
+          const error = new Error("cancelled")
+          ;(error as any).name = "TransactionCanceledException"
+          ;(error as any).CancellationReasons = input.TransactItems.map((i: any) =>
+            i.Put && String(fromAttributeMap(i.Put.Item).sk).includes("#v#")
+              ? { Code: "ConditionalCheckFailed" }
+              : { Code: "None" },
+          )
+          throw error
+        })
+
+        const error = yield* Transaction.transactWrite([
+          LifecycleMembers.update({ memberId: "m-1" }).pipe(Entity.set({ label: "L2" })),
+        ]).pipe(Effect.flip)
+
+        expect(error._tag).toBe("ValidationError")
+        expect(String((error as ValidationError).cause)).toContain("snapshot already exists")
+        expect(mockTransactWriteItems).toHaveBeenCalledTimes(1)
+      }).pipe(Effect.provide(TestLayer)),
+    )
+  })
+
   describe("unsupported ops are rejected, not silently reinterpreted (#100)", () => {
     const upsertInput = { userId: "u-1", email: "a@x.io", name: "Alice", role: "admin" } as const
 

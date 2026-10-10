@@ -23,9 +23,10 @@ import type {
   UpdateItemCommandInput,
 } from "@aws-sdk/client-dynamodb"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Exit } from "effect"
+import { Data, Effect, Exit } from "effect"
 import { DynamoClient, type DynamoClientService } from "../DynamoClient.js"
 import type { PutVerdict, WriteCancellationReason } from "../Entity.js"
+import { attributeValueEquals } from "./AttributeValueEquals.js"
 
 /**
  * A planned write: its items, and how to read a cancellation of them — the
@@ -42,11 +43,13 @@ export interface TransactPlan {
 }
 
 /** The op tried to write twice — it could not have been one atomic write. */
-export class UnplannableWrite extends Error {
-  constructor(readonly operation: string) {
-    super(
-      `${operation}: the op issued a second write after its first; a transaction can only ` +
-        "carry an op whose write is one request. This is a defect in effect-dynamodb.",
+export class UnplannableWrite extends Data.TaggedError("UnplannableWrite")<{
+  readonly operation: string
+}> {
+  override get message(): string {
+    return (
+      `${this.operation}: the op issued a second write after its first; a transaction can ` +
+      "only carry an op whose write is one request. This is a defect in effect-dynamodb."
     )
   }
 }
@@ -153,7 +156,7 @@ export const planWrite = <A, E, R>(
     const isOwnKey = (key: Record<string, AttributeValue> | undefined) =>
       key !== undefined &&
       Object.keys(ownKey).length === Object.keys(key).length &&
-      Object.entries(ownKey).every(([name, value]) => key[name]?.S === value.S)
+      Object.entries(ownKey).every(([name, value]) => attributeValueEquals(key[name], value))
     const record = (name: string, items: ReadonlyArray<TransactWriteItem>) => {
       const guarded = items.length === 1 && conditionOfItem(items[0]!) !== undefined
       if (options?.rowMissing === true && !missingAnswered && guarded) {
@@ -167,7 +170,7 @@ export const planWrite = <A, E, R>(
       }
       if (recorded !== undefined) {
         wroteTwice = true
-        return Effect.die(new UnplannableWrite(operation))
+        return Effect.die(new UnplannableWrite({ operation }))
       }
       recorded = items
       return Effect.fail(
@@ -190,12 +193,12 @@ export const planWrite = <A, E, R>(
       updateItem: (input) => record("UpdateItem", [asUpdate(input)]),
       deleteItem: (input) => record("DeleteItem", [asDelete(input)]),
       transactWriteItems: (input) => record("TransactWriteItems", input.TransactItems ?? []),
-      batchWriteItem: () => Effect.die(new UnplannableWrite(operation)),
+      batchWriteItem: () => Effect.die(new UnplannableWrite({ operation })),
     }
     const exit = yield* Effect.exit(effect.pipe(Effect.provideService(DynamoClient, recording)))
     // Checked first: the op may have swallowed the defect, but a plan of only
     // its first write would silently drop the second.
-    if (wroteTwice) return yield* Effect.die(new UnplannableWrite(operation))
+    if (wroteTwice) return yield* Effect.die(new UnplannableWrite({ operation }))
     if (recorded !== undefined) return { items: recorded, ownRow, readOwnRow }
     if (Exit.isFailure(exit)) return yield* Effect.failCause(exit.cause)
     return { items: [], ownRow, readOwnRow }

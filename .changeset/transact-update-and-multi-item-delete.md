@@ -20,18 +20,24 @@ surface before anything is sent: `ItemNotFound`, `ConditionalCheckFailed`
 (`patch` of a missing item), `OptimisticLockError` (a stale `expectedVersion`)
 and `RefNotFound`. A plain update, which standalone relies on its write's own
 condition to find a missing row, is checked with one read instead, and a missing
-row takes the op's own path: a complete `.set()` is planned as its create. Because the transactional write is the standalone write, the
-two cannot drift.
+row takes the op's own path: a complete `.set()` is planned as its create.
+Because the transactional write is the standalone write, the two cannot drift.
 
 The recorded items join the transaction as a guarded write and are read the way
 a guarded put's are:
 
 - A taken unique value is `UniqueConstraintViolation`.
-- A cancelled main item is `TransactionCancelled` when the caller's own
-  `.condition()` rejected a row that is still there.
+- A retain snapshot the row's history already holds is the same
+  `ValidationError` the standalone op reports; re-reading would not change it.
+- A cancelled main item is `TransactionCancelled` only when the caller's own
+  `.condition()` rejected it and the row is unchanged since the read: the
+  stored item the cancellation returns is compared with the row the plan read
+  (its version and incarnation, or the attributes the item's condition names).
 - Any other cancellation is a lost race, which is planned again from a fresh
   read. A row deleted meanwhile then takes the op's missing-row path, and a
-  pinned `expectedVersion` it no longer has fails `OptimisticLockError`.
+  pinned `expectedVersion` it no longer has fails `OptimisticLockError`. A race
+  lost on every attempt is `OptimisticLockError` with both versions on a
+  versioned entity, otherwise `ConcurrentModification` naming what changed.
 
 A transaction whose updates all resolve to no write sends nothing, as the
 standalone no-op update does.

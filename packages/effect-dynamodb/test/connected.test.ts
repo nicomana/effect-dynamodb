@@ -2282,7 +2282,7 @@ describeConnected("Connected integration tests", () => {
         }).pipe(provide),
     )
 
-    it.effect("the same race under a caller condition cancels the transaction", () =>
+    it.effect("the same race under a caller condition is re-planned and committed", () =>
       Effect.gen(function* () {
         yield* Users.put({
           userId: "u-race-c",
@@ -2292,7 +2292,11 @@ describeConnected("Connected integration tests", () => {
           createdBy: "test",
         }).asEffect()
 
-        const err = yield* raceAfterFirstRead(
+        // Only the email was raced; the caller's `role: "member"` still holds.
+        // The cancellation's stored item shows the row changed since the read,
+        // so it is a race — re-planned from a fresh read and committed — not
+        // the caller's condition failing.
+        yield* raceAfterFirstRead(
           Users.update({ userId: "u-race-c" })
             .pipe(Entity.set({ email: "racec-b@test.com" }))
             .asEffect(),
@@ -2300,17 +2304,17 @@ describeConnected("Connected integration tests", () => {
             Users.delete({ userId: "u-race-c" }).pipe(Users.condition({ role: "member" })),
             txTask("t-race-c"),
           ]),
-        ).pipe(Effect.flip)
-
-        // A cancelled guard cannot be told apart from the caller's condition,
-        // so it is not retried — exactly as for a guarded put.
-        expect(err._tag).toBe("TransactionCancelled")
-        const user = yield* Users.get({ userId: "u-race-c" }).asEffect()
-        expect(user.email).toBe("racec-b@test.com")
-        expect(yield* sentinelOwner("racec-b@test.com")).toBe(
-          "$connected-test#v1#user#userid_u-race-c",
         )
-        expect(yield* taskExists("t-race-c")).toBe(false)
+
+        const gone = yield* Users.get({ userId: "u-race-c" })
+          .asEffect()
+          .pipe(
+            Effect.map(() => "exists"),
+            Effect.catchTag("ItemNotFound", () => Effect.succeed("not found")),
+          )
+        expect(gone).toBe("not found")
+        expect(yield* sentinelOwner("racec-b@test.com")).toBeUndefined()
+        expect(yield* taskExists("t-race-c")).toBe(true)
       }).pipe(provide),
     )
 
