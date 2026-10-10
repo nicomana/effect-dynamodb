@@ -1,6 +1,6 @@
 {
   "name": "@effect-dynamodb/geo",
-  "version": "1.24.0",
+  "version": "1.25.0",
   "description": "Geospatial index and search for effect-dynamodb using H3 hexagonal grid",
   "type": "module",
   "license": "MIT",

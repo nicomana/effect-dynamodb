@@ -1,6 +1,6 @@
 {
   "name": "@effect-dynamodb/schema",
-  "version": "1.24.0",
+  "version": "1.25.0",
   "description": "Pure Effect Schema-driven entity/aggregate modeling and relationship derivation for effect-dynamodb — importable without @aws-sdk",
   "type": "module",
   "license": "MIT",
